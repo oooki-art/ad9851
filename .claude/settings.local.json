@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -f ad9851_port_stm32f1_stdperiph.c ad9851_port_stm32f1_stdperiph_parallel.c ad9851_port_stm32_hal.c ad9851_port_stm32_hal_parallel.c ad9851_port_gd32.c ad9851_port_gd32_parallel.c)"
+    ]
+  }
+}
