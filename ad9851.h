@@ -45,15 +45,43 @@ typedef struct {
     void (*delay_us)   (uint32_t us);     /* 可为 NULL */
 } ad9851_io_t;
 
+/**
+ * @brief AD9851 影子寄存器 (shadow register / 软件副本)
+ *
+ * 【为什么需要它】
+ *   AD9851 是"只写"器件：写进芯片的寄存器读不回来。若想单独修改其中
+ *   一项（例如只调相位、频率保持不变），硬件上没法做"读-改-写"。
+ *   通用解法是在 MCU 内存里维护一份与芯片寄存器一一对应的副本——
+ *   "影子寄存器"。
+ *
+ * 【怎么用】
+ *   1) 要改哪一项，就改影子里对应的成员；
+ *   2) 调 ad9851_update() 把整份影子编码成 40 位字重新写进芯片。
+ *   好处：① 改一项不动其它项；② 随时能查"芯片当前是什么状态"，便于调试。
+ *
+ * 【各成员 ←→ AD9851 的 40 位控制字 W0..W39】
+ *   ftw        -> W0..W31   32 位频率控制字
+ *   six_x_mult -> W32       6x 参考时钟倍频使能
+ *               (W33        恒为 0)
+ *   power_down -> W34       掉电
+ *   phase      -> W35..W39  5 位相位
+ */
 typedef struct {
-    ad9851_io_t   io;
-    ad9851_mode_t mode;
-    uint32_t      sys_clk_hz;   /* DDS 内部最终系统时钟(Hz)，见 ad9851_init */
-    uint8_t       use_6x_mult;  /* 1 = 使能片内 6 倍参考时钟倍频器 */
-    /* 当前状态，使频率/相位互不覆盖 */
-    uint32_t      cur_ftw;
-    uint8_t       cur_phase;    /* 0..31 */
-} ad9851_t;
+    uint32_t ftw;         /* 32 位频率控制字 */
+    uint8_t  phase;       /* 5 位相位 0..31 (0..360°, 步进 11.25°) */
+    uint8_t  six_x_mult;  /* 6x 倍频使能: 0/1 */
+    uint8_t  power_down;  /* 掉电: 0/1 */
+} ad9851_shadow_t;
+
+typedef struct ad9851_s ad9851_t;
+struct ad9851_s {
+    ad9851_io_t     io;
+    ad9851_mode_t   mode;
+    uint32_t        sys_clk_hz;  /* DDS 内部最终系统时钟(Hz)，见 ad9851_init */
+    ad9851_shadow_t shadow;      /* 影子寄存器：芯片当前状态的软件副本 */
+    /* 内部：init 时按模式绑定为串行或并行发送，运行期不再判断模式 */
+    void (*send)(ad9851_t *dev, uint32_t ftw, uint8_t ctrl);
+};
 
 /**
  * @brief  初始化 AD9851 设备对象：设置引脚空闲电平并按模式执行复位序列。
@@ -77,7 +105,16 @@ void ad9851_init(ad9851_t *dev, const ad9851_io_t *io, ad9851_mode_t mode,
 void ad9851_reset(ad9851_t *dev);
 
 /**
- * @brief  设置输出频率，保留当前相位。
+ * @brief  按影子寄存器当前内容把整份 40 位字写进芯片（刷新）。
+ * @note   上面/下面的 set_* / power_* 都是"改影子字段 + 调用本函数"。
+ *         你也可以直接改 dev->shadow 的多个字段后调一次本函数批量生效。
+ * @param  dev  设备对象指针。
+ * @return 无。
+ */
+void ad9851_update(ad9851_t *dev);
+
+/**
+ * @brief  改影子里的频率字并刷新芯片；相位等其它字段保持不变。
  * @param  dev      设备对象指针。
  * @param  freq_hz  目标频率(Hz)，超出 [0, sys_clk/2] 会被饱和处理。
  * @return 无。
@@ -85,7 +122,7 @@ void ad9851_reset(ad9851_t *dev);
 void ad9851_set_frequency(ad9851_t *dev, double freq_hz);
 
 /**
- * @brief  只改相位，保留当前频率。
+ * @brief  改影子里的相位并刷新芯片；频率保持不变。
  * @param  dev    设备对象指针。
  * @param  phase  相位值，取 0..31，对应 0..360°，步进 11.25°（仅低 5 位有效）。
  * @return 无。
@@ -93,7 +130,7 @@ void ad9851_set_frequency(ad9851_t *dev, double freq_hz);
 void ad9851_set_phase(ad9851_t *dev, uint8_t phase);
 
 /**
- * @brief  同时设置频率与相位。
+ * @brief  同时改影子里的频率与相位并刷新芯片。
  * @param  dev      设备对象指针。
  * @param  freq_hz  目标频率(Hz)。
  * @param  phase    相位值 0..31（0..360°，步进 11.25°）。
@@ -102,11 +139,19 @@ void ad9851_set_phase(ad9851_t *dev, uint8_t phase);
 void ad9851_set_freq_phase(ad9851_t *dev, double freq_hz, uint8_t phase);
 
 /**
- * @brief  进入低功耗(power-down)，保留当前频率字。再次调用 set_frequency 唤醒。
+ * @brief  进入低功耗(power-down)：置影子的 power_down 位并刷新。
+ * @note   频率字仍保留在影子里；用 ad9851_power_up() 唤醒（不会自动唤醒）。
  * @param  dev  设备对象指针。
  * @return 无。
  */
 void ad9851_power_down(ad9851_t *dev);
+
+/**
+ * @brief  退出低功耗：清影子的 power_down 位并刷新，恢复原频率输出。
+ * @param  dev  设备对象指针。
+ * @return 无。
+ */
+void ad9851_power_up(ad9851_t *dev);
 
 /**
  * @brief  直接写 40 位字，需要自定义控制字时使用。

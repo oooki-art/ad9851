@@ -52,10 +52,13 @@ static void fq_ud_pulse(const ad9851_t *dev)
     io_delay(dev);
 }
 
-static uint8_t ad9851_base_ctrl(const ad9851_t *dev)
+/* 把影子寄存器的控制部分编码成 8 位控制字 W32..W39 */
+static uint8_t ad9851_encode_ctrl(const ad9851_shadow_t *s)
 {
-    uint8_t ctrl = dev->use_6x_mult ? AD9851_CTRL_6X_MULT : 0u;
-    ctrl |= (uint8_t)((dev->cur_phase & 0x1Fu) << AD9851_PHASE_SHIFT);
+    uint8_t ctrl = 0u;
+    if (s->six_x_mult) { ctrl |= AD9851_CTRL_6X_MULT; }  /* bit0 = W32 */
+    if (s->power_down) { ctrl |= AD9851_CTRL_PWRDOWN; }  /* bit2 = W34 */
+    ctrl |= (uint8_t)((s->phase & 0x1Fu) << AD9851_PHASE_SHIFT); /* bit3..7 = W35..W39 */
     return ctrl;
 }
 
@@ -90,12 +93,8 @@ static void send_parallel(ad9851_t *dev, uint32_t ftw, uint8_t ctrl)
 
 void ad9851_write_word(ad9851_t *dev, uint32_t ftw, uint8_t control_byte)
 {
-    if (dev->mode == AD9851_MODE_PARALLEL) {
-        send_parallel(dev, ftw, control_byte);
-    } else {
-        send_serial(dev, ftw, control_byte);
-    }
-    fq_ud_pulse(dev);   /* 锁存输出 */
+    dev->send(dev, ftw, control_byte);  /* init 时已绑定串/并行，运行期不判断 */
+    fq_ud_pulse(dev);                   /* 锁存输出 */
 }
 
 void ad9851_reset(ad9851_t *dev)
@@ -120,9 +119,14 @@ void ad9851_init(ad9851_t *dev, const ad9851_io_t *io, ad9851_mode_t mode,
     dev->io          = *io;
     dev->mode        = mode;
     dev->sys_clk_hz  = sys_clk_hz;
-    dev->use_6x_mult = use_6x_mult ? 1u : 0u;
-    dev->cur_ftw     = 0;
-    dev->cur_phase   = 0;
+    /* 按模式一次性绑定发送函数，之后 write_word 直接调用，不再判断 */
+    dev->send = (mode == AD9851_MODE_PARALLEL) ? send_parallel : send_serial;
+
+    /* 影子寄存器初值：频率 0、相位 0、6x 倍频按入参、不掉电 */
+    dev->shadow.ftw        = 0;
+    dev->shadow.phase      = 0;
+    dev->shadow.six_x_mult = use_6x_mult ? 1u : 0u;
+    dev->shadow.power_down = 0;
 
     /* 引脚空闲电平 */
     dev->io.write_w_clk(0);
@@ -149,29 +153,41 @@ uint32_t ad9851_calc_ftw(const ad9851_t *dev, double freq_hz)
     return (uint32_t)(ftw + 0.5);    /* 四舍五入 */
 }
 
+/* 影子寄存器 -> 芯片：所有 set_* / power_* 都最终走这里刷新 */
+void ad9851_update(ad9851_t *dev)
+{
+    ad9851_write_word(dev, dev->shadow.ftw, ad9851_encode_ctrl(&dev->shadow));
+}
+
 void ad9851_set_freq_phase(ad9851_t *dev, double freq_hz, uint8_t phase)
 {
-    dev->cur_ftw   = ad9851_calc_ftw(dev, freq_hz);
-    dev->cur_phase = phase & 0x1Fu;
-    ad9851_write_word(dev, dev->cur_ftw, ad9851_base_ctrl(dev));
+    dev->shadow.ftw   = ad9851_calc_ftw(dev, freq_hz);
+    dev->shadow.phase = phase & 0x1Fu;
+    ad9851_update(dev);
 }
 
 void ad9851_set_frequency(ad9851_t *dev, double freq_hz)
 {
-    dev->cur_ftw = ad9851_calc_ftw(dev, freq_hz);
-    ad9851_write_word(dev, dev->cur_ftw, ad9851_base_ctrl(dev));
+    dev->shadow.ftw = ad9851_calc_ftw(dev, freq_hz);
+    ad9851_update(dev);
 }
 
 void ad9851_set_phase(ad9851_t *dev, uint8_t phase)
 {
-    dev->cur_phase = phase & 0x1Fu;
-    ad9851_write_word(dev, dev->cur_ftw, ad9851_base_ctrl(dev));
+    dev->shadow.phase = phase & 0x1Fu;
+    ad9851_update(dev);
 }
 
 void ad9851_power_down(ad9851_t *dev)
 {
-    uint8_t ctrl = (uint8_t)(ad9851_base_ctrl(dev) | AD9851_CTRL_PWRDOWN);
-    ad9851_write_word(dev, dev->cur_ftw, ctrl);
+    dev->shadow.power_down = 1u;
+    ad9851_update(dev);
+}
+
+void ad9851_power_up(ad9851_t *dev)
+{
+    dev->shadow.power_down = 0u;
+    ad9851_update(dev);
 }
 
 /* ===================== 扫频 ===================== */

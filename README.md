@@ -31,14 +31,28 @@
 - 30MHz 晶振 + 使能 6 倍频 → `ad9851_init(dev, io, mode, 180000000, 1)`
 - 外部直接喂 180MHz、不倍频 → `ad9851_init(dev, io, mode, 180000000, 0)`
 
-## 频率 / 相位
+## 影子寄存器 (shadow register)
+
+AD9851 是"只写"器件，寄存器读不回来。驱动在 `dev->shadow` 里保存一份
+与芯片 40 位控制字一一对应的软件副本（频率/相位/6x倍频/掉电）。所有
+`set_*`、`power_*` 都是同一个套路：**改影子里的某个字段 → 调 `ad9851_update()`
+把整份重新写进芯片**。好处：改一项不动其它项，且随时能查芯片当前状态。
+结构体定义和位映射注释见 `ad9851.h` 的 `ad9851_shadow_t`。
+
+## 频率 / 相位 / 功耗
 
 ```c
-ad9851_set_frequency(&dev, 10e6);   // 改频率，保留当前相位
-ad9851_set_phase(&dev, 8);          // 改相位(0..31=0..360°,步进11.25°)，保留频率
+ad9851_set_frequency(&dev, 10e6);   // 改频率，相位等保持不变
+ad9851_set_phase(&dev, 8);          // 改相位(0..31=0..360°,步进11.25°)，频率不变
 ad9851_set_freq_phase(&dev, 1e6, 8);// 一起设
+ad9851_power_down(&dev);            // 掉电（频率字保留）
+ad9851_power_up(&dev);              // 唤醒
+
+// 也可以直接改影子的多个字段，再一次性刷新：
+dev.shadow.phase = 16;
+dev.shadow.ftw   = ad9851_calc_ftw(&dev, 1e6);
+ad9851_update(&dev);
 ```
-驱动内部记住 cur_ftw / cur_phase，二者互不覆盖。
 
 ## 扫频
 
